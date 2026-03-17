@@ -1,172 +1,333 @@
+/**
+ * Discord Voice Recorder - Research Use Only
+ * Uses discord.js-selfbot-v13 + @discordjs/voice
+ * Records voice channels, rotates at 20MB, converts to MP3 via ffmpeg, sends to webhook
+ */
+
 const { Client } = require('discord.js-selfbot-v13');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, StreamType } = require('@discordjs/voice');
+const {
+  joinVoiceChannel,
+  entersState,
+  VoiceConnectionStatus,
+  EndBehaviorType,
+} = require('@discordjs/voice');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
-const ffmpeg = require('ffmpeg-static');
+const { spawn } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 const axios = require('axios');
 const FormData = require('form-data');
-const { Readable } = require('stream');
-const sodium = require('libsodium-wrappers');
-require('dotenv').config();
 
-// مولد إشارة الاتصال (لإبقاء القناة مفتوحة)
-class SilenceGenerator extends Readable {
-    _read() {
-        setTimeout(() => {
-            this.push(Buffer.from([0xF8, 0xFF, 0xFE]));
-        }, 20);
-    }
-}
+// ===================== CONFIG =====================
+const USER_TOKEN   = 'YOUR_USER_TOKEN_HERE';
+const WEBHOOK_URL  = 'YOUR_WEBHOOK_URL_HERE';
+const TEMP_DIR     = path.join(__dirname, 'temp');
+const MAX_SIZE_MB  = 20;                        // rotate at 20 MB
+const MAX_SIZE_B   = MAX_SIZE_MB * 1024 * 1024;
+const CHECK_INTERVAL_MS = 2000;                 // check file size every 2s
+// ==================================================
+
+if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 const client = new Client({ checkUpdate: false });
 
-client.on('raw', (packet) => {
-    if (packet.t === 'READY') {
-        const settings = packet.d.user_settings;
-        if (settings && settings.friend_source_flags === null) {
-            settings.friend_source_flags = { all: false, mutual_friends: false, mutual_guilds: false };
-        }
-    }
-});
+// Track active recording sessions per guild
+// Map<guildId, SessionState>
+const sessions = new Map();
 
-const USER_TOKEN = process.env.USER_TOKEN;
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
-const TEMP_DIR = './recordings';
+// ─────────────────────────────────────────────────
+// Utility: safe file delete
+// ─────────────────────────────────────────────────
+function safeDelete(filePath) {
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch (e) {
+    console.error(`[DELETE ERROR] ${filePath}:`, e.message);
+  }
+}
 
-if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR);
+// ─────────────────────────────────────────────────
+// Convert PCM → MP3 using ffmpeg-static (streaming)
+// Returns a Promise that resolves with the mp3 path
+// ─────────────────────────────────────────────────
+function convertToMp3(pcmPath) {
+  return new Promise((resolve, reject) => {
+    const mp3Path = pcmPath.replace('.pcm', '.mp3');
 
-let currentWriteStream = null;
-let currentFilePath = null;
-let partCounter = 1;
+    const ffmpeg = spawn(ffmpegPath, [
+      '-y',
+      '-f', 's16le',         // PCM signed 16-bit little-endian
+      '-ar', '48000',        // sample rate Discord uses
+      '-ac', '2',            // stereo
+      '-i', pcmPath,
+      '-codec:a', 'libmp3lame',
+      '-b:a', '48k',         // 48 kbps as requested
+      mp3Path,
+    ]);
 
-// المعالجة بدون أي قيود على الحجم!
-async function processAndSend(filePath, partNum) {
-    if (!fs.existsSync(filePath)) return;
-    
-    const stats = fs.statSync(filePath);
-    
-    // إذا كان الملف 0 بايت تماماً (مستحيل تحويله)
-    if (stats.size === 0) {
-        console.log(`⚠️ الجزء ${partNum} فارغ تماماً (0 بايت)، لا يوجد صوت لتحويله.`);
-        fs.unlinkSync(filePath);
-        return;
-    }
-
-    console.log(`⏳ جاري تحويل الجزء ${partNum} (الحجم: ${stats.size} بايت)...`);
-    
-    const mp3Path = filePath.replace('.pcm', '.mp3');
-    // أوامر تحويل مرنة تقبل حتى الملفات الصغيرة جداً
-    const command = `"${ffmpeg}" -y -f s16le -ar 48000 -ac 2 -i "${filePath}" -c:a libmp3lame -b:a 64k "${mp3Path}"`;
-
-    exec(command, async (error) => {
-        if (error) {
-            console.error(`❌ فشل التحويل (قد يكون الملف صغيراً جداً على FFmpeg):`, error.message);
-            return;
-        }
-
-        const form = new FormData();
-        form.append('file', fs.createReadStream(mp3Path), `Audio_Record_Part_${partNum}.mp3`);
-        form.append('content', `✅ **تسجيل جديد** | الجزء: ${partNum} | الحجم الخام: ${stats.size} بايت`);
-
-        try {
-            await axios.post(WEBHOOK_URL, form, { 
-                headers: form.getHeaders(),
-                maxBodyLength: Infinity,
-                maxContentLength: Infinity
-            });
-            console.log(`🚀 تم رفع الجزء ${partNum} للويب هوك بنجاح!`);
-        } catch (uploadError) {
-            console.error(`❌ فشل الرفع للويب هوك:`, uploadError.message);
-        } finally {
-            try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch (e) {}
-            try { if (fs.existsSync(mp3Path)) fs.unlinkSync(mp3Path); } catch (e) {}
-        }
+    ffmpeg.stderr.on('data', () => {}); // suppress ffmpeg logs
+    ffmpeg.on('close', (code) => {
+      if (code === 0) resolve(mp3Path);
+      else reject(new Error(`ffmpeg exited with code ${code}`));
     });
+    ffmpeg.on('error', reject);
+  });
 }
 
-function startNewFile() {
-    if (currentWriteStream) currentWriteStream.end();
-    const fileName = `rec_${Date.now()}_part${partCounter}.pcm`;
-    currentFilePath = path.join(TEMP_DIR, fileName);
-    // استخدام وضع الإلحاق (a) لمنع تلف البيانات إذا تحدث أكثر من شخص
-    currentWriteStream = fs.createWriteStream(currentFilePath, { flags: 'a' });
-    console.log(`📁 بدأ تسجيل ملف جديد: الجزء ${partCounter}`);
+// ─────────────────────────────────────────────────
+// Send MP3 to Discord Webhook
+// ─────────────────────────────────────────────────
+async function sendToWebhook(mp3Path) {
+  const form = new FormData();
+  const fileName = path.basename(mp3Path);
+  form.append('file', fs.createReadStream(mp3Path), { filename: fileName });
+  form.append('content', `🎙️ Recording: \`${fileName}\``);
+
+  await axios.post(WEBHOOK_URL, form, {
+    headers: form.getHeaders(),
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+  });
+
+  console.log(`[WEBHOOK] Sent: ${fileName}`);
 }
 
-client.on('ready', async () => {
-    await sodium.ready;
-    console.log(`✅ النظام البرمجي متصل بدون قيود. الحساب: ${client.user.tag}`);
-});
+// ─────────────────────────────────────────────────
+// Process a closed PCM file: convert → send → delete
+// ─────────────────────────────────────────────────
+async function processPcmFile(pcmPath) {
+  try {
+    console.log(`[PROCESS] Converting ${path.basename(pcmPath)} ...`);
+    const mp3Path = await convertToMp3(pcmPath);
+    await sendToWebhook(mp3Path);
+    safeDelete(pcmPath);
+    safeDelete(mp3Path);
+    console.log(`[DONE] Cleaned up ${path.basename(pcmPath)}`);
+  } catch (err) {
+    console.error(`[PROCESS ERROR] ${pcmPath}:`, err.message);
+  }
+}
 
-client.on('voiceStateUpdate', (oldState, newState) => {
-    if (newState.id !== client.user.id) return;
+// ─────────────────────────────────────────────────
+// Session: manages one recording session per guild
+// ─────────────────────────────────────────────────
+class RecordingSession {
+  constructor(connection, channelId, guildId) {
+    this.connection  = connection;
+    this.channelId   = channelId;
+    this.guildId     = guildId;
+    this.receiver   = connection.receiver;
 
-    if (!oldState.channelId && newState.channelId) {
-        console.log(`🎙️ تم رصد دخول للقناة الصوتية. جاري تأسيس الاتصال الآمن...`);
-        
-        const connection = joinVoiceChannel({
-            channelId: newState.channelId,
-            guildId: newState.guild.id,
-            adapterCreator: newState.guild.voiceAdapterCreator,
-            selfDeaf: false,
-            selfMute: false
-        });
+    this.currentPcmPath   = null;
+    this.currentWriteStream = null;
+    this.bytesWritten     = 0;
+    this.chunkIndex       = 0;
+    this.sizeCheckTimer   = null;
+    this.activeStreams     = new Set(); // track open user audio streams
 
-        const player = createAudioPlayer();
-        const silenceStream = new SilenceGenerator();
-        const resource = createAudioResource(silenceStream, { inputType: StreamType.Opus });
-        player.play(resource);
-        connection.subscribe(player);
+    this._startNewFile();
+    this._startSizeWatcher();
+    this._listenForUsers();
 
-        startNewFile();
+    console.log(`[SESSION] Started recording in guild ${guildId}`);
+  }
 
-        connection.receiver.speaking.on('start', (userId) => {
-            if (userId === client.user.id) return;
+  // Create a new PCM file for writing
+  _startNewFile() {
+    const ts = Date.now();
+    this.chunkIndex++;
+    this.currentPcmPath = path.join(
+      TEMP_DIR,
+      `rec_${this.guildId}_${ts}_${this.chunkIndex}.pcm`
+    );
+    this.currentWriteStream = fs.createWriteStream(this.currentPcmPath, { flags: 'a' });
+    this.bytesWritten = 0;
+    console.log(`[FILE] New file: ${path.basename(this.currentPcmPath)}`);
+  }
 
-            console.log(`🗣️ تم رصد صوت من المستخدم: ${userId} - جاري الكتابة في الملف...`);
+  // Rotate: close current file, process it, open new one
+  async _rotate() {
+    if (!this.currentWriteStream) return;
 
-            // حذفنا EndBehaviorType.AfterSilence لنسمح بتسجيل مستمر دون تقطيع
-            const audioStream = connection.receiver.subscribe(userId);
-            const decoder = new (require('prism-media').opus.Decoder)({ rate: 48000, channels: 2, frameSize: 960 });
-            
-            audioStream.pipe(decoder).on('data', (chunk) => {
-                if (currentWriteStream) {
-                    currentWriteStream.write(chunk);
-                    
-                    if (fs.existsSync(currentFilePath)) {
-                        const stats = fs.statSync(currentFilePath);
-                        // التدوير عند 15 ميجابايت فقط
-                        if (stats.size > 15 * 1024 * 1024) {
-                            const pathToProcess = currentFilePath;
-                            const partToProcess = partCounter++;
-                            startNewFile();
-                            processAndSend(pathToProcess, partToProcess);
-                        }
-                    }
-                }
-            });
-        });
-    }
+    const closedPath = this.currentPcmPath;
+    const ws = this.currentWriteStream;
 
-    if (oldState.channelId && !newState.channelId) {
-        console.log('🚪 تم رصد خروج. جاري تصدير الملف فوراً...');
-        if (currentWriteStream) {
-            currentWriteStream.end();
-            const pathToProcess = currentFilePath;
-            const partToProcess = partCounter;
-            
-            setTimeout(() => {
-                processAndSend(pathToProcess, partToProcess);
-            }, 1000);
-            
-            currentWriteStream = null;
-            partCounter = 1;
+    // Detach immediately so incoming audio goes to the new file
+    this._startNewFile();
+
+    ws.end(() => {
+      processPcmFile(closedPath); // fire and forget
+    });
+  }
+
+  // Watch file size every CHECK_INTERVAL_MS
+  _startSizeWatcher() {
+    this.sizeCheckTimer = setInterval(() => {
+      if (this.bytesWritten >= MAX_SIZE_B) {
+        console.log(`[ROTATE] ${path.basename(this.currentPcmPath)} reached ${MAX_SIZE_MB}MB`);
+        this._rotate();
+      }
+    }, CHECK_INTERVAL_MS);
+  }
+
+  // Subscribe to every speaking user in the channel
+  _listenForUsers() {
+    // When a user starts speaking, subscribe to their audio
+    this.receiver.speaking.on('start', (userId) => {
+      if (this.activeStreams.has(userId)) return;
+      this._subscribeUser(userId);
+    });
+  }
+
+  _subscribeUser(userId) {
+    this.activeStreams.add(userId);
+
+    const audioStream = this.receiver.subscribe(userId, {
+      end: {
+        behavior: EndBehaviorType.AfterSilence,
+        duration: 500, // ms of silence before closing stream
+      },
+    });
+
+    // Write raw opus decoded PCM directly
+    audioStream.on('data', (chunk) => {
+      if (this.currentWriteStream && !this.currentWriteStream.closed) {
+        // Use write() return value to apply backpressure and protect RAM
+        const ok = this.currentWriteStream.write(chunk);
+        this.bytesWritten += chunk.length;
+        if (!ok) {
+          // Drain before writing more (stream-based RAM protection)
+          audioStream.pause();
+          this.currentWriteStream.once('drain', () => audioStream.resume());
         }
+      }
+    });
+
+    audioStream.on('end', () => {
+      this.activeStreams.delete(userId);
+    });
+
+    audioStream.on('error', (err) => {
+      console.error(`[AUDIO STREAM ERROR] user ${userId}:`, err.message);
+      this.activeStreams.delete(userId);
+    });
+  }
+
+  // Graceful stop
+  async stop() {
+    clearInterval(this.sizeCheckTimer);
+
+    if (this.currentWriteStream) {
+      const closedPath = this.currentPcmPath;
+      await new Promise((resolve) => this.currentWriteStream.end(resolve));
+      this.currentWriteStream = null;
+
+      // Process last chunk if it has data
+      if (fs.existsSync(closedPath) && fs.statSync(closedPath).size > 0) {
+        processPcmFile(closedPath);
+      } else {
+        safeDelete(closedPath);
+      }
     }
+
+    try {
+      this.connection.destroy();
+    } catch (_) {}
+
+    console.log(`[SESSION] Stopped recording in guild ${this.guildId}`);
+  }
+}
+
+// ─────────────────────────────────────────────────
+// Discord client events
+// ─────────────────────────────────────────────────
+client.on('ready', () => {
+  console.log(`[READY] Logged in as ${client.user.tag}`);
+  console.log(`[INFO]  Watching for voice channel joins...`);
 });
 
-process.on('unhandledRejection', error => console.error('⚠️ Unhandled promise rejection:', error));
-process.on('uncaughtException', error => console.error('⚠️ Uncaught exception:', error));
+// Fired when the selfbot's voice state changes
+client.on('voiceStateUpdate', async (oldState, newState) => {
+  // Only care about OUR own account
+  if (newState.id !== client.user.id) return;
 
-client.login(USER_TOKEN).catch(err => console.error("❌ فشل تسجيل الدخول:", err.message));
+  const guildId = newState.guild.id;
+
+  // Joined a voice channel
+  if (newState.channelId && newState.channelId !== oldState.channelId) {
+    // Already recording in this guild → stop old session first
+    if (sessions.has(guildId)) {
+      await sessions.get(guildId).stop();
+      sessions.delete(guildId);
+    }
+
+    const channel = newState.channel;
+    if (!channel) return;
+
+    console.log(`[JOIN] Joined voice channel: ${channel.name} (${channel.id})`);
+
+    try {
+      // Join with selfbot — adapterCreator handles gateway
+      const connection = joinVoiceChannel({
+        channelId: channel.id,
+        guildId:   guildId,
+        adapterCreator: newState.guild.voiceAdapterCreator,
+        selfDeaf:  false,
+        selfMute:  true, // mute ourselves so we don't echo
+      });
+
+      // Wait until connection is ready
+      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+
+      const session = new RecordingSession(connection, channel.id, guildId);
+      sessions.set(guildId, session);
+
+      // Handle unexpected disconnects
+      connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        try {
+          // Attempt reconnect for 5 seconds
+          await Promise.race([
+            entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+            entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+          ]);
+        } catch {
+          if (sessions.has(guildId)) {
+            await sessions.get(guildId).stop();
+            sessions.delete(guildId);
+          }
+        }
+      });
+
+    } catch (err) {
+      console.error(`[CONNECTION ERROR]:`, err.message);
+    }
+  }
+
+  // Left the voice channel
+  if (!newState.channelId && oldState.channelId) {
+    if (sessions.has(guildId)) {
+      console.log(`[LEAVE] Left voice channel in guild ${guildId}`);
+      await sessions.get(guildId).stop();
+      sessions.delete(guildId);
+    }
+  }
+});
+
+// ─────────────────────────────────────────────────
+// Graceful shutdown on CTRL+C
+// ─────────────────────────────────────────────────
+async function shutdown() {
+  console.log('\n[SHUTDOWN] Stopping all sessions...');
+  for (const [guildId, session] of sessions) {
+    await session.stop();
+    sessions.delete(guildId);
+  }
+  client.destroy();
+  process.exit(0);
+}
+
+process.on('SIGINT',  shutdown);
+process.on('SIGTERM', shutdown);
+
+// Login
+client.login(USER_TOKEN);
