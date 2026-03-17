@@ -8,10 +8,17 @@ const axios = require('axios');
 const FormData = require('form-data');
 require('dotenv').config();
 
-// إعداد العميل مع تعطيل التحقق من التحديثات
-const client = new Client({ 
-    checkUpdate: false,
-    patchVoice: true // تفعيل إصلاحات الصوت للحسابات الشخصية
+const client = new Client({ checkUpdate: false });
+
+// --- حل مشكلة الـ TypeError (طريقة حقن البيانات) ---
+client.on('raw', (packet) => {
+    // إذا كانت الحزمة هي بيانات الجاهزية، نقوم بتنظيفها قبل معالجتها
+    if (packet.t === 'READY') {
+        const userSettings = packet.d.user_settings;
+        if (userSettings && userSettings.friend_source_flags === null) {
+            userSettings.friend_source_flags = { all: false, mutual_friends: false, mutual_guilds: false };
+        }
+    }
 });
 
 const USER_TOKEN = process.env.USER_TOKEN;
@@ -26,31 +33,26 @@ let currentFilePath = null;
 let partCounter = 1;
 let isRecording = false;
 
-// --- وظيفة المعالجة والإرسال ---
 async function processAndSend(filePath, partNum) {
     if (!fs.existsSync(filePath)) return;
     
     const mp3Path = filePath.replace('.pcm', '.mp3');
-    // جودة 48k توفر مساحة هائلة وتحافظ على وضوح الصوت الأكاديمي
     const command = `"${ffmpeg}" -f s16le -ar 48000 -ac 2 -i "${filePath}" -ab 48k "${mp3Path}"`;
     
     exec(command, async (error) => {
-        if (error) {
-            console.error(`❌ خطأ في تحويل الجزء ${partNum}:`, error);
-            return;
-        }
+        if (error) return console.error(`❌ Error Part ${partNum}:`, error);
 
         const form = new FormData();
         form.append('file', fs.createReadStream(mp3Path));
-        form.append('content', `📦 **تقرير تسجيل جديد**\nرقم الجزء: ${partNum}\nالتوقيت: ${new Date().toLocaleString('ar-SA')}`);
+        form.append('content', `✅ **تم تسجيل الجزء رقم ${partNum}**`);
 
         try {
             await axios.post(WEBHOOK_URL, form, { headers: form.getHeaders() });
-            console.log(`✅ تم رفع الجزء ${partNum} بنجاح.`);
-            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-            if (fs.existsSync(mp3Path)) fs.unlinkSync(mp3Path);
+            fs.unlinkSync(filePath);
+            fs.unlinkSync(mp3Path);
+            console.log(`✅ Part ${partNum} uploaded and cleaned.`);
         } catch (err) {
-            console.error(`❌ فشل رفع Webhook:`, err.message);
+            console.error(`❌ Webhook error:`, err.message);
         }
     });
 }
@@ -61,22 +63,17 @@ function startNewFile() {
     currentFilePath = path.join(TEMP_DIR, fileName);
     currentWriteStream = fs.createWriteStream(currentFilePath);
     isRecording = true;
-    console.log(`📁 بدأ تسجيل ملف جديد: الجزء ${partCounter}`);
 }
 
-// --- التعامل مع الأحداث ---
-
 client.on('ready', () => {
-    console.log(`🚀 السكربت متصل الآن باسم: ${client.user.tag}`);
+    console.log(`🚀 السكربت متصل الآن: ${client.user.tag}`);
 });
 
 client.on('voiceStateUpdate', (oldState, newState) => {
     if (newState.id !== client.user.id) return;
 
-    // الدخول لقناة صوتية
     if (!oldState.channelId && newState.channelId) {
-        console.log('🎙️ تم رصد دخولك للقناة. جاري بدء التسجيل...');
-        
+        console.log('🎙️ بدأ التسجيل...');
         const connection = joinVoiceChannel({
             channelId: newState.channelId,
             guildId: newState.guild.id,
@@ -97,13 +94,9 @@ client.on('voiceStateUpdate', (oldState, newState) => {
             pcmStream.on('data', (chunk) => {
                 if (currentWriteStream && isRecording) {
                     currentWriteStream.write(chunk);
-                    
-                    // تدوير الملف إذا تجاوز 20 ميجا
-                    const stats = fs.statSync(currentFilePath);
-                    if (stats.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
+                    if (fs.statSync(currentFilePath).size > MAX_FILE_SIZE_MB * 1024 * 1024) {
                         const oldPath = currentFilePath;
-                        const oldPart = partCounter;
-                        partCounter++;
+                        const oldPart = partCounter++;
                         startNewFile();
                         processAndSend(oldPath, oldPart);
                     }
@@ -112,22 +105,18 @@ client.on('voiceStateUpdate', (oldState, newState) => {
         });
     }
 
-    // الخروج من القناة
     if (oldState.channelId && !newState.channelId) {
-        console.log('🚪 تم الخروج. جاري إرسال الجزء الأخير...');
+        console.log('🚪 تم الخروج وإرسال الجزء الأخير.');
         isRecording = false;
         if (currentWriteStream) {
             currentWriteStream.end();
             const lastPath = currentFilePath;
             const lastPart = partCounter;
-            setTimeout(() => processAndSend(lastPath, lastPart), 2000); 
+            setTimeout(() => processAndSend(lastPath, lastPart), 2000);
             currentWriteStream = null;
             partCounter = 1;
         }
     }
 });
 
-// تشغيل السكربت مع معالجة خطأ الدخول الشهير
-client.login(USER_TOKEN).catch(err => {
-    console.error("❌ فشل تسجيل الدخول. تأكد من صحة التوكن في Railway Variables.");
-});
+client.login(USER_TOKEN).catch(e => console.error("Login Failed:", e.message));
