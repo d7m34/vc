@@ -1,25 +1,26 @@
 /**
- * Discord Voice Recorder v5
- * KEY: Client must be initialized with { patchVoice: true }
- * This patches @discordjs/voice to work with user tokens (selfbot)
+ * Discord Voice Recorder v6
+ * - patchVoice: true for selfbot
+ * - Does NOT wait for VoiceConnectionStatus.Ready (causes timeout on Railway)
+ * - Starts recording immediately when connection is created
+ * - Rotation at 20MB → MP3 → Webhook → Delete
  */
 
 'use strict';
 
-const { Client }             = require('discord.js-selfbot-v13');
+const { Client }      = require('discord.js-selfbot-v13');
 const {
   joinVoiceChannel,
-  entersState,
   VoiceConnectionStatus,
   EndBehaviorType,
-}                            = require('@discordjs/voice');
-const { OpusEncoder }        = require('@discordjs/opus');
-const fs                     = require('fs');
-const path                   = require('path');
-const { spawn }              = require('child_process');
-const ffmpegPath             = require('ffmpeg-static');
-const axios                  = require('axios');
-const FormData               = require('form-data');
+}                     = require('@discordjs/voice');
+const { OpusEncoder } = require('@discordjs/opus');
+const fs              = require('fs');
+const path            = require('path');
+const { spawn }       = require('child_process');
+const ffmpegPath      = require('ffmpeg-static');
+const axios           = require('axios');
+const FormData        = require('form-data');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const TOKEN       = process.env.TOKEN;
@@ -115,7 +116,7 @@ class RecordingSession {
     this._openFile();
     this._timer = setInterval(() => this._checkRotate(), SIZE_CHECK);
     this._attach();
-    console.log(`[SESSION] Started — guild ${guildId}`);
+    console.log(`[SESSION] Recording started — guild ${guildId}`);
   }
 
   _openFile() {
@@ -138,7 +139,7 @@ class RecordingSession {
     this._rotating = true;
     const oldPath  = this._pcmPath;
     const oldWs    = this._ws;
-    this._openFile();          // redirect audio to new file immediately
+    this._openFile();
     this._rotating = false;
     oldWs.end(() => processPcm(oldPath));
   }
@@ -157,6 +158,7 @@ class RecordingSession {
     this.receiver.speaking.on('start', userId => {
       if (this._subs.has(userId)) return;
       this._subs.add(userId);
+      console.log(`[SPEAKING] User ${userId} started`);
 
       const audio = this.receiver.subscribe(userId, {
         end: { behavior: EndBehaviorType.AfterSilence, duration: 300 },
@@ -169,12 +171,9 @@ class RecordingSession {
         } catch (_) {}
       });
 
-      audio.on('end',   ()  => this._subs.delete(userId));
+      audio.on('end',   ()  => { this._subs.delete(userId); console.log(`[SPEAKING] User ${userId} stopped`); });
       audio.on('close', ()  => this._subs.delete(userId));
-      audio.on('error', err => {
-        console.error(`[AUDIO ${userId}]`, err.message);
-        this._subs.delete(userId);
-      });
+      audio.on('error', err => { console.error(`[AUDIO ${userId}]`, err.message); this._subs.delete(userId); });
     });
   }
 
@@ -193,7 +192,6 @@ class RecordingSession {
 
 // ─── CLIENT ───────────────────────────────────────────────────────────────────
 
-// patchVoice: true → patches @discordjs/voice internals to accept user tokens
 const client = new Client({ checkUpdate: false, patchVoice: true });
 
 client.on('ready', () => console.log(`[READY] ${client.user.tag}`));
@@ -214,7 +212,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     return;
   }
 
-  // Joined / switched channel
+  // Joined / switched
   if (newState.channelId && newState.channelId !== oldState.channelId) {
     if (sessions.has(guildId)) {
       const s = sessions.get(guildId);
@@ -236,25 +234,24 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         selfMute:       true,
       });
 
-      await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
-      console.log(`[CONNECTED] Ready`);
+      console.log(`[CONNECTION] Created, state: ${connection.state.status}`);
 
+      // Start recording immediately — don't wait for Ready (causes timeout)
+      // The receiver works as soon as the connection object exists
       const session = new RecordingSession(connection, guildId);
       sessions.set(guildId, session);
 
+      // Log state changes for debugging
+      connection.on('stateChange', (oldS, newS) => {
+        console.log(`[VOICE STATE] ${oldS.status} → ${newS.status}`);
+      });
+
       connection.on(VoiceConnectionStatus.Disconnected, async () => {
-        try {
-          await Promise.race([
-            entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-            entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-          ]);
-          console.log(`[RECONNECT] Reconnected`);
-        } catch {
-          if (sessions.has(guildId)) {
-            const s = sessions.get(guildId);
-            sessions.delete(guildId);
-            await s.stop();
-          }
+        console.warn(`[DISCONNECT] Guild ${guildId}`);
+        if (sessions.has(guildId)) {
+          const s = sessions.get(guildId);
+          sessions.delete(guildId);
+          await s.stop();
         }
       });
 
