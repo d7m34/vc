@@ -1,25 +1,24 @@
 /**
- * Discord Voice Recorder — selfbot edition
- * Uses discord.js-selfbot-v13 built-in voice (no @discordjs/voice needed)
+ * Discord Voice Recorder — selfbot edition v4
  * TOKEN and WEBHOOK_URL must be set as environment variables.
  */
 
 'use strict';
 
-const { Client }    = require('discord.js-selfbot-v13');
-const fs            = require('fs');
-const path          = require('path');
-const { spawn }     = require('child_process');
-const ffmpegPath    = require('ffmpeg-static');
-const axios         = require('axios');
-const FormData      = require('form-data');
+const { Client }  = require('discord.js-selfbot-v13');
+const fs          = require('fs');
+const path        = require('path');
+const { spawn }   = require('child_process');
+const ffmpegPath  = require('ffmpeg-static');
+const axios       = require('axios');
+const FormData    = require('form-data');
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const TOKEN       = process.env.TOKEN;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const TEMP_DIR    = path.join(__dirname, 'temp');
-const MAX_BYTES   = 20 * 1024 * 1024; // 20 MB → rotate
-const SIZE_CHECK  = 2000;             // ms between size checks
+const MAX_BYTES   = 20 * 1024 * 1024;
+const SIZE_CHECK  = 2000;
 // ──────────────────────────────────────────────────────────────────────────────
 
 if (!TOKEN || !WEBHOOK_URL) {
@@ -29,7 +28,7 @@ if (!TOKEN || !WEBHOOK_URL) {
 
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
-const sessions = new Map(); // guildId → RecordingSession
+const sessions = new Map();
 
 // ─── UTILS ────────────────────────────────────────────────────────────────────
 
@@ -82,7 +81,6 @@ async function processPcm(pcmPath) {
   try {
     const size = fs.existsSync(pcmPath) ? fs.statSync(pcmPath).size : 0;
     if (size < 4096) { safeDelete(pcmPath); return; }
-
     console.log(`[PIPELINE] Converting ${path.basename(pcmPath)} (${(size / 1e6).toFixed(2)} MB)`);
     mp3Path = await convertToMp3(pcmPath);
     await sendToWebhook(mp3Path);
@@ -97,8 +95,8 @@ async function processPcm(pcmPath) {
 // ─── RECORDING SESSION ────────────────────────────────────────────────────────
 
 class RecordingSession {
-  constructor(voiceConnection, guildId) {
-    this.vc       = voiceConnection;
+  constructor(vc, guildId) {
+    this.vc       = vc;
     this.guildId  = guildId;
     this._ws      = null;
     this._pcmPath = null;
@@ -132,30 +130,30 @@ class RecordingSession {
     this._rotating = true;
     const oldPath = this._pcmPath;
     const oldWs   = this._ws;
-    this._openFile();           // new file ready immediately — no audio lost
+    this._openFile();
     this._rotating = false;
     oldWs.end(() => processPcm(oldPath));
   }
 
   _write(chunk) {
-    if (!this._ws || this._ws.destroyed) return;
+    if (!this._ws || this._ws.destroyed) return true;
     const ok = this._ws.write(chunk);
     this._bytes += chunk.length;
     return ok;
   }
 
   _attach() {
-    // discord.js-selfbot-v13 exposes voice.receiver on the connection
     const receiver = this.vc.receiver;
     if (!receiver) {
-      console.error('[SESSION] No receiver available on voice connection');
+      console.error('[SESSION] No receiver on voice connection');
       return;
     }
 
     receiver.speaking.on('start', userId => {
-      // subscribe returns an Opus/PCM stream depending on the selfbot lib
       const audio = receiver.subscribe(userId);
       if (!audio) return;
+
+      console.log(`[SPEAKING] User ${userId} started`);
 
       audio.on('data', chunk => {
         const ok = this._write(chunk);
@@ -165,20 +163,19 @@ class RecordingSession {
         }
       });
 
+      audio.on('end',   ()  => console.log(`[SPEAKING] User ${userId} stopped`));
       audio.on('error', err => console.error(`[AUDIO ${userId}]`, err.message));
     });
   }
 
   async stop() {
     clearInterval(this._timer);
-
     if (this._ws && !this._ws.destroyed) {
       const last = this._pcmPath;
       await new Promise(r => this._ws.end(r));
       this._ws = null;
       processPcm(last);
     }
-
     try { this.vc.disconnect(); } catch (_) {}
     console.log(`[SESSION] Stopped — guild ${this.guildId}`);
   }
@@ -208,7 +205,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     return;
   }
 
-  // Joined / switched channel
+  // Joined or switched channel
   if (newState.channelId && newState.channelId !== oldState.channelId) {
     if (sessions.has(guildId)) {
       const s = sessions.get(guildId);
@@ -222,14 +219,25 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     console.log(`[JOIN] #${channel.name} (${channel.id})`);
 
     try {
-      // discord.js-selfbot-v13 voice join — returns a VoiceConnection
-      const vc = await channel.join();
-      console.log(`[CONNECTED] Voice connection ready`);
+      // ✅ Correct way to join voice with discord.js-selfbot-v13
+      const vc = await newState.guild.me.voice.setChannel(channel);
 
-      const session = new RecordingSession(vc, guildId);
+      // Wait briefly for receiver to be ready
+      await new Promise(r => setTimeout(r, 1500));
+
+      // Get the actual VoiceConnection from the client
+      const connection = client.voice.connections.get(guildId);
+      if (!connection) {
+        console.error('[ERROR] No voice connection found after join');
+        return;
+      }
+
+      console.log(`[CONNECTED] Voice ready in #${channel.name}`);
+
+      const session = new RecordingSession(connection, guildId);
       sessions.set(guildId, session);
 
-      vc.on('disconnect', async () => {
+      connection.on('disconnect', async () => {
         console.warn(`[DISCONNECT] Guild ${guildId}`);
         if (sessions.has(guildId)) {
           const s = sessions.get(guildId);
@@ -252,7 +260,7 @@ async function shutdown(sig) {
     sessions.delete(id);
     await session.stop();
   }
-  await new Promise(r => setTimeout(r, 4000)); // let pipelines finish
+  await new Promise(r => setTimeout(r, 4000));
   client.destroy();
   process.exit(0);
 }
